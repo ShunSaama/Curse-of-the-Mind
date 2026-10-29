@@ -1,18 +1,16 @@
 package de.jakob.lotm.beyonders.abilities.abyss;
 
 import de.jakob.lotm.LOTMCraft;
-import de.jakob.lotm.attachments.KillStatsComponent;
+import de.jakob.lotm.attachments.MarionetteComponent;
 import de.jakob.lotm.attachments.ModAttachments;
 import de.jakob.lotm.beyonders.abilities.core.Ability;
 import de.jakob.lotm.beyonders.abilities.core.AbilityUsedEvent;
-import de.jakob.lotm.effect.ModEffects;
-import de.jakob.lotm.events.KillStatEventHandler;
-import de.jakob.lotm.network.PacketHandler;
-import de.jakob.lotm.network.packets.toClient.OpenPlayerDivinationScreenPacket;
+import de.jakob.lotm.beyonders.acting.ActingCapHelper;
+import de.jakob.lotm.data.ModDataComponents;
+import de.jakob.lotm.entity.custom.AvatarEntity;
+import de.jakob.lotm.item.ModItems;
 import de.jakob.lotm.particle.ModParticles;
 import de.jakob.lotm.util.BeyonderData;
-import de.jakob.lotm.util.data.PlayerInfo;
-import de.jakob.lotm.util.data.PlayerSelectionWorkType;
 import de.jakob.lotm.util.helper.AbilityUtil;
 import de.jakob.lotm.util.helper.ParticleUtil;
 import de.jakob.lotm.util.scheduling.ServerScheduler;
@@ -24,9 +22,10 @@ import net.minecraft.server.level.ServerLevel;
 import net.minecraft.server.level.ServerPlayer;
 import net.minecraft.sounds.SoundEvents;
 import net.minecraft.sounds.SoundSource;
-import net.minecraft.world.effect.MobEffectInstance;
+import net.minecraft.world.InteractionHand;
 import net.minecraft.world.entity.Entity;
 import net.minecraft.world.entity.LivingEntity;
+import net.minecraft.world.item.ItemStack;
 import net.minecraft.world.level.Level;
 import net.neoforged.bus.api.SubscribeEvent;
 import net.neoforged.fml.common.EventBusSubscriber;
@@ -46,16 +45,15 @@ import java.util.UUID;
 /**
  * Sequence 0 Abyss ability: Curse of the Mind.
  * <p>
- * Opens the shared player selection GUI listing online sinners
- * (players with at least {@link #MIN_PLAYER_KILLS} player kills). The cursed victim:
+ * Requires the target's blood in the offhand; the blood of the target's marionettes,
+ * avatars or virtual personas works as well. The curse seizes the blood owner and every
+ * vessel belonging to them at once. Each cursed vessel:
  * <ul>
- *   <li>loses sanity every 10 seconds for 2.5 minutes, scaling with its own sequence:
- *       5% of max sanity at seq 0, 10% at seq 1, 15% at seq 2 and so on — and each kill it
- *       commits while cursed (mobs, players, anything alive) raises that drain by another 1%,</li>
- *   <li>rolls for loss of control with a chance of 1% per kill it ever committed,</li>
- *   <li>loses a final 20% sanity the instant the curse expires.</li>
+ *   <li>loses 5% of its max sanity every 10 seconds for 60 seconds,</li>
+ *   <li>loses a final 20% of max sanity the instant the curse expires,</li>
+ *   <li>player vessels also have their max sanity reduced by 20% for 10 minutes.</li>
  * </ul>
- * The curse breaks when the victim dies.
+ * The curse on a vessel breaks when that vessel dies.
  */
 @EventBusSubscriber(modid = LOTMCraft.MOD_ID)
 public class CurseOfTheMindAbility extends Ability {
@@ -63,14 +61,11 @@ public class CurseOfTheMindAbility extends Ability {
     // --- balance constants ---
     private static final int COOLDOWN_SECONDS = 10 * 60;
     private static final float SPIRITUALITY_COST = 5000;
-    private static final int DURATION_TICKS = 20 * 150;       // 2.5 minutes
+    private static final int DURATION_TICKS = 20 * 60;        // 60 seconds
     private static final int DRAIN_INTERVAL_TICKS = 20 * 10;  // every 10 seconds
-    private static final float BASE_DRAIN_PER_INTERVAL = 0.05f; // 5% of max sanity
-    private static final float DRAIN_GROWTH_PER_KILL = 0.01f;   // +1% drain per kill while cursed
-    private static final float FINAL_SANITY_LOSS = 0.2f;        // 20% of max sanity
-    private static final int MIN_PLAYER_KILLS = 10;
-    private static final float CONTROL_LOSS_PER_KILL = 0.01f;
-    private static final float CONTROL_LOSS_CHANCE_CAP = 0.75f; // cap so veteran killers aren't perma-stunned
+    private static final float DRAIN_PER_INTERVAL = 0.05f;    // 5% of max sanity
+    private static final float FINAL_SANITY_LOSS = 0.2f;      // 20% of max sanity
+    private static final long CAP_REDUCTION_DURATION_MS = 10L * 60 * 1000; // 10 minutes
 
     // Abyss blood red, brighter than Malice Seed's dark dust so the two curses read differently
     private static final DustParticleOptions CURSE_DUST =
@@ -78,13 +73,11 @@ public class CurseOfTheMindAbility extends Ability {
 
     private static final int ABYSS_COLOR = 0xFFa3070c;
 
-    // Server curse state: cursed target UUID -> caster UUID / scheduler task id
-    private static final Map<UUID, UUID> targetToCaster = new HashMap<>();
-    private static final Map<UUID, UUID> targetToTask = new HashMap<>();
-    // Kills the victim commits while cursed; each one deepens the sanity drain
-    private static final Map<UUID, Integer> killsWhileCursed = new HashMap<>();
+    // Server curse state: cursed vessel UUID -> caster UUID / scheduler task id
+    private static final Map<UUID, UUID> vesselToCaster = new HashMap<>();
+    private static final Map<UUID, UUID> vesselToTask = new HashMap<>();
 
-    // Targets whose curse expired while offline; the final strike lands on rejoin
+    // Vessels whose curse expired while offline; the final strike lands on rejoin
     private static final Set<UUID> pendingFinalStrikes = new HashSet<>();
 
     public CurseOfTheMindAbility(String id) {
@@ -114,175 +107,219 @@ public class CurseOfTheMindAbility extends Ability {
             return;
         }
 
-        List<PlayerInfo> sinners = getEligibleSinners(serverLevel.getServer(), caster.getUUID());
-        if (sinners.isEmpty()) {
+        // The Abyss requires blood: the target's, or the blood of one of their vessels
+        ItemStack offHandItem = caster.getItemInHand(InteractionHand.OFF_HAND);
+        if (!offHandItem.is(ModItems.BLOOD)) {
             refundFailedCast(caster);
-            AbilityUtil.sendActionBar(caster, Component.translatable("ability.lotmcraft.curse_of_the_mind.no_targets").withColor(ABYSS_COLOR));
+            AbilityUtil.sendActionBar(caster, Component.translatable("ability.lotmcraft.curse.no_blood").withColor(ABYSS_COLOR));
             return;
         }
 
-        // Open the shared player selection GUI; the choice returns via PlayerDivinationSelectedPacket
-        PacketHandler.sendToPlayer(caster, new OpenPlayerDivinationScreenPacket(sinners, PlayerSelectionWorkType.CURSE_OF_THE_MIND));
+        String ownerStr = offHandItem.getOrDefault(ModDataComponents.BLOOD_OWNER, "");
+        UUID bloodOwnerUUID = ownerStr.isEmpty() ? null : UUID.fromString(ownerStr);
+        if (bloodOwnerUUID == null) {
+            offHandItem.consume(1, caster);
+            refundFailedCast(caster);
+            AbilityUtil.sendActionBar(caster, Component.translatable("ability.lotmcraft.curse.no_target").withColor(ABYSS_COLOR));
+            return;
+        }
+
+        UUID rootUUID = resolveRoot(serverLevel, bloodOwnerUUID);
+        List<LivingEntity> vessels = gatherVessels(serverLevel, rootUUID);
+        if (vessels.isEmpty()) {
+            offHandItem.consume(1, caster);
+            refundFailedCast(caster);
+            AbilityUtil.sendActionBar(caster, Component.translatable("ability.lotmcraft.curse.no_target").withColor(ABYSS_COLOR));
+            return;
+        }
+
+        offHandItem.consume(1, caster);
+        for (LivingEntity vessel : vessels) {
+            applyCurse(serverLevel, caster, vessel);
+        }
+        AbilityUtil.sendActionBar(caster, Component.translatable("ability.lotmcraft.curse_of_the_mind.applied").withColor(ABYSS_COLOR));
     }
 
     /**
-     * Entry point after the player picked a sinner in the selection GUI.
-     * Cost and cooldown were already charged by the framework, so invalid picks refund both.
+     * The blood owner leads to the root of the vessel group: an avatar belongs to its
+     * original owner, a marionette to its controller, anything else is the root itself.
      */
-    public static void performCurseOnSelected(ServerPlayer caster, UUID targetUUID) {
-        ServerLevel level = caster.serverLevel();
-        ServerPlayer target = level.getServer().getPlayerList().getPlayer(targetUUID);
-
-        if (target == null || isBelowKillThreshold(target)) {
-            refundFailedCast(caster);
-            AbilityUtil.sendActionBar(caster, Component.translatable("ability.lotmcraft.curse_of_the_mind.no_targets").withColor(ABYSS_COLOR));
-            return;
+    private static UUID resolveRoot(ServerLevel level, UUID bloodOwnerUUID) {
+        Entity ownerEntity = findEntity(level, bloodOwnerUUID);
+        if (ownerEntity instanceof AvatarEntity avatar) {
+            return avatar.getOriginalOwner();
         }
-
-        if (targetToCaster.containsKey(targetUUID)) {
-            refundFailedCast(caster);
-            AbilityUtil.sendActionBar(caster, Component.translatable("ability.lotmcraft.curse_of_the_mind.already_cursed").withColor(ABYSS_COLOR));
-            return;
+        if (ownerEntity instanceof ServerPlayer player) {
+            MarionetteComponent marionette = player.getData(ModAttachments.MARIONETTE_COMPONENT.get());
+            if (marionette.isMarionette()) {
+                try {
+                    return UUID.fromString(marionette.getControllerUUID());
+                } catch (IllegalArgumentException ignored) {
+                    return player.getUUID();
+                }
+            }
+            return player.getUUID();
         }
-
-        if (LOTMCraft.abilityHandler.getById(getStaticId()) instanceof CurseOfTheMindAbility ability) {
-            ability.applyCurse(level, caster, target);
-        }
+        return bloodOwnerUUID;
     }
 
-    private void applyCurse(ServerLevel level, ServerPlayer caster, ServerPlayer target) {
-        targetToCaster.put(target.getUUID(), caster.getUUID());
-        killsWhileCursed.remove(target.getUUID());
+    /**
+     * The root player and every vessel belonging to them: their marionettes and their
+     * avatars / virtual personas. Vessels that are offline or unloaded are skipped.
+     */
+    private static List<LivingEntity> gatherVessels(ServerLevel level, UUID rootUUID) {
+        List<LivingEntity> vessels = new ArrayList<>();
+        MinecraftServer server = level.getServer();
 
-        level.playSound(null, target.getX(), target.getY(), target.getZ(),
+        ServerPlayer root = server.getPlayerList().getPlayer(rootUUID);
+        if (root != null) {
+            vessels.add(root);
+            for (UUID marionetteUUID : root.getData(ModAttachments.MARIONETTE_OWNER_COMPONENT.get()).getMarionettes()) {
+                ServerPlayer marionette = server.getPlayerList().getPlayer(marionetteUUID);
+                if (marionette != null) {
+                    vessels.add(marionette);
+                }
+            }
+            for (UUID avatarUUID : root.getData(ModAttachments.VIRTUAL_PERSONAS.get()).getAvatars()) {
+                if (findEntity(level, avatarUUID) instanceof AvatarEntity avatar) {
+                    vessels.add(avatar);
+                }
+            }
+        } else {
+            // Root offline: curse the blood owner itself if its entity is still around
+            if (findEntity(level, rootUUID) instanceof LivingEntity living) {
+                vessels.add(living);
+            }
+        }
+        return vessels;
+    }
+
+    private static Entity findEntity(ServerLevel level, UUID uuid) {
+        Entity entity = level.getEntity(uuid);
+        if (entity != null) {
+            return entity;
+        }
+        // Vessels may dwell in other dimensions
+        for (ServerLevel otherLevel : level.getServer().getAllLevels()) {
+            entity = otherLevel.getEntity(uuid);
+            if (entity != null) {
+                return entity;
+            }
+        }
+        return null;
+    }
+
+    private void applyCurse(ServerLevel level, ServerPlayer caster, LivingEntity vessel) {
+        vesselToCaster.put(vessel.getUUID(), caster.getUUID());
+
+        level.playSound(null, vessel.getX(), vessel.getY(), vessel.getZ(),
                 SoundEvents.WITHER_AMBIENT, SoundSource.HOSTILE, 1.2f, 0.5f);
-        ParticleUtil.spawnParticles(level, CURSE_DUST, target.getEyePosition(), 40, 0.75, 0);
-        ParticleUtil.spawnParticles(level, ModParticles.BLACK_NOTE.get(), target.getEyePosition(), 12, 0.5, 0.05);
+        ParticleUtil.spawnParticles(level, CURSE_DUST, vessel.getEyePosition(), 40, 0.75, 0);
+        ParticleUtil.spawnParticles(level, ModParticles.BLACK_NOTE.get(), vessel.getEyePosition(), 12, 0.5, 0.05);
 
         // The victim is told briefly and mysteriously — never who, never why
-        target.sendSystemMessage(Component.translatable("ability.lotmcraft.curse_of_the_mind.cursed")
-                .withStyle(ChatFormatting.DARK_RED, ChatFormatting.ITALIC));
-        AbilityUtil.sendActionBar(caster, Component.translatable("ability.lotmcraft.curse_of_the_mind.applied", target.getName()).withColor(ABYSS_COLOR));
+        if (vessel instanceof ServerPlayer vesselPlayer) {
+            ActingCapHelper.applyMindCurseCapReduction(vesselPlayer, CAP_REDUCTION_DURATION_MS);
+            vesselPlayer.sendSystemMessage(Component.translatable("ability.lotmcraft.curse_of_the_mind.cursed")
+                    .withStyle(ChatFormatting.DARK_RED, ChatFormatting.ITALIC));
+        }
 
         UUID taskId = ServerScheduler.scheduleForDuration(
                 20, DRAIN_INTERVAL_TICKS, DURATION_TICKS,
-                () -> drainTick(level, target.getUUID()),
-                () -> finishCurse(level, target.getUUID()),
+                () -> drainTick(level, vessel.getUUID()),
+                () -> finishCurse(level, vessel.getUUID()),
                 level, () -> 1.0);
-        targetToTask.put(target.getUUID(), taskId);
+        vesselToTask.put(vessel.getUUID(), taskId);
 
-        NeoForge.EVENT_BUS.post(new AbilityUsedEvent(level, target.position(), caster, target, this,
+        NeoForge.EVENT_BUS.post(new AbilityUsedEvent(level, vessel.position(), caster, vessel, this,
                 interactionFlags, interactionRadius, interactionCacheTicks));
     }
 
-    private void drainTick(ServerLevel level, UUID targetUUID) {
-        ServerPlayer target = level.getServer().getPlayerList().getPlayer(targetUUID);
-        if (target == null) {
-            return; // curse keeps running while the target is offline
+    private void drainTick(ServerLevel level, UUID vesselUUID) {
+        LivingEntity vessel = resolveVessel(level, vesselUUID);
+        if (vessel == null) {
+            return; // curse keeps running while the vessel is offline or unloaded
         }
-
-        // The curse strips more the lower the victim stands on the sequence ladder:
-        // 5% of max sanity at seq 0, 10% at seq 1, 15% at seq 2 and so on
-        int victimSequence = BeyonderData.getSequence(target);
-        float drain = BASE_DRAIN_PER_INTERVAL * (1 + victimSequence)
-                + killsWhileCursed.getOrDefault(targetUUID, 0) * DRAIN_GROWTH_PER_KILL;
-
-        // Bypasses per-sequence resistance: a Sequence 0 curse cannot be shrugged off
-        target.getData(ModAttachments.SANITY_COMPONENT)
-                .increaseSanityAndSyncIgnoreSequence(-drain, target);
-
-        // Loss-of-control chance: +1% per kill ever committed by the target, capped
-        KillStatsComponent killStats = target.getData(ModAttachments.KILL_STATS_COMPONENT);
-        float controlLossChance = Math.min(killStats.getTotalKills() * CONTROL_LOSS_PER_KILL, CONTROL_LOSS_CHANCE_CAP);
-        if (random.nextFloat() < controlLossChance) {
-            int amplifier = Math.min(3, killStats.getTotalKills() / 30);
-            target.addEffect(new MobEffectInstance(ModEffects.LOOSING_CONTROL, 20 * 6, amplifier, false, true));
-            level.playSound(null, target.getX(), target.getY(), target.getZ(),
-                    SoundEvents.PHANTOM_SWOOP, SoundSource.HOSTILE, 0.7f, 0.4f);
-        }
-
-        ParticleUtil.spawnParticles(level, CURSE_DUST, target.getEyePosition(), 8, 0.6, 0.02);
-        ParticleUtil.spawnParticles(level, ModParticles.BLACK_NOTE.get(), target.getEyePosition(), 3, 0.3, 0.03);
-    }
-
-    private void finishCurse(ServerLevel level, UUID targetUUID) {
-        targetToCaster.remove(targetUUID);
-        targetToTask.remove(targetUUID);
-        killsWhileCursed.remove(targetUUID);
-
-        ServerPlayer target = level.getServer().getPlayerList().getPlayer(targetUUID);
-        if (target == null) {
-            pendingFinalStrikes.add(targetUUID); // deliver the final strike on rejoin
+        if (!vessel.isAlive()) {
+            breakCurse(level, vessel);
             return;
         }
 
-        applyFinalStrike(level, target);
+        // Bypasses per-sequence resistance: a Sequence 0 curse cannot be shrugged off
+        vessel.getData(ModAttachments.SANITY_COMPONENT)
+                .increaseSanityAndSyncIgnoreSequence(-DRAIN_PER_INTERVAL, vessel);
+
+        ParticleUtil.spawnParticles(level, CURSE_DUST, vessel.getEyePosition(), 8, 0.6, 0.02);
+        ParticleUtil.spawnParticles(level, ModParticles.BLACK_NOTE.get(), vessel.getEyePosition(), 3, 0.3, 0.03);
     }
 
-    private static void applyFinalStrike(ServerLevel level, ServerPlayer target) {
-        target.getData(ModAttachments.SANITY_COMPONENT)
-                .increaseSanityAndSyncIgnoreSequence(-FINAL_SANITY_LOSS, target);
+    private static LivingEntity resolveVessel(ServerLevel level, UUID vesselUUID) {
+        ServerPlayer player = level.getServer().getPlayerList().getPlayer(vesselUUID);
+        if (player != null) {
+            return player;
+        }
+        return findEntity(level, vesselUUID) instanceof LivingEntity living ? living : null;
+    }
 
-        level.playSound(null, target.getX(), target.getY(), target.getZ(),
+    private void finishCurse(ServerLevel level, UUID vesselUUID) {
+        vesselToCaster.remove(vesselUUID);
+        vesselToTask.remove(vesselUUID);
+
+        LivingEntity vessel = resolveVessel(level, vesselUUID);
+        if (vessel == null) {
+            pendingFinalStrikes.add(vesselUUID); // deliver the final strike on rejoin
+            return;
+        }
+
+        applyFinalStrike(level, vessel);
+    }
+
+    private static void applyFinalStrike(ServerLevel level, LivingEntity vessel) {
+        vessel.getData(ModAttachments.SANITY_COMPONENT)
+                .increaseSanityAndSyncIgnoreSequence(-FINAL_SANITY_LOSS, vessel);
+
+        level.playSound(null, vessel.getX(), vessel.getY(), vessel.getZ(),
                 SoundEvents.WITHER_AMBIENT, SoundSource.HOSTILE, 2.0f, 0.4f);
-        ParticleUtil.spawnParticles(level, CURSE_DUST, target.getEyePosition(), 60, 2.0, 0);
-        ParticleUtil.spawnParticles(level, ModParticles.BLACK_NOTE.get(), target.getEyePosition(), 30, 1.0, 0.1);
-        target.sendSystemMessage(Component.translatable("ability.lotmcraft.curse_of_the_mind.final_strike")
-                .withStyle(ChatFormatting.DARK_RED, ChatFormatting.ITALIC));
+        ParticleUtil.spawnParticles(level, CURSE_DUST, vessel.getEyePosition(), 60, 2.0, 0);
+        ParticleUtil.spawnParticles(level, ModParticles.BLACK_NOTE.get(), vessel.getEyePosition(), 30, 1.0, 0.1);
+        if (vessel instanceof ServerPlayer vesselPlayer) {
+            vesselPlayer.sendSystemMessage(Component.translatable("ability.lotmcraft.curse_of_the_mind.final_strike")
+                    .withStyle(ChatFormatting.DARK_RED, ChatFormatting.ITALIC));
+        }
     }
 
-    // The curse dies with its victim; kills committed by a cursed player deepen the drain
+    // The curse dies with its vessel
     @SubscribeEvent
-    public static void onLivingDeath(LivingDeathEvent event) {
+    public static void onVesselDeath(LivingDeathEvent event) {
         if (event.getEntity().level().isClientSide) {
             return;
         }
 
-        // Any kill by a cursed player counts — mobs, players, anything alive,
-        // including kills dealt through projectiles and explosions
-        ServerPlayer killer = KillStatEventHandler.resolveKiller(event.getSource());
-        if (killer != null && targetToCaster.containsKey(killer.getUUID())) {
-            killsWhileCursed.merge(killer.getUUID(), 1, Integer::sum);
+        LivingEntity vessel = event.getEntity();
+        if (!vesselToCaster.containsKey(vessel.getUUID())) {
+            return;
         }
 
-        if (event.getEntity() instanceof ServerPlayer victim && targetToCaster.containsKey(victim.getUUID())) {
-            breakCurse(victim.serverLevel(), victim);
-        }
+        breakCurse((ServerLevel) vessel.level(), vessel);
     }
 
-    private static void breakCurse(ServerLevel level, ServerPlayer victim) {
-        UUID victimUUID = victim.getUUID();
+    private static void breakCurse(ServerLevel level, LivingEntity vessel) {
+        UUID vesselUUID = vessel.getUUID();
 
-        UUID taskId = targetToTask.remove(victimUUID);
+        UUID taskId = vesselToTask.remove(vesselUUID);
         if (taskId != null) {
             ServerScheduler.cancel(taskId); // also cancels the linked final-strike task
         }
-        targetToCaster.remove(victimUUID);
-        killsWhileCursed.remove(victimUUID);
-        pendingFinalStrikes.remove(victimUUID);
+        vesselToCaster.remove(vesselUUID);
+        pendingFinalStrikes.remove(vesselUUID);
 
-        level.playSound(null, victim.getX(), victim.getY(), victim.getZ(),
+        level.playSound(null, vessel.getX(), vessel.getY(), vessel.getZ(),
                 SoundEvents.PHANTOM_SWOOP, SoundSource.HOSTILE, 1.0f, 0.3f);
-        ParticleUtil.spawnParticles(level, CURSE_DUST, victim.getEyePosition(), 20, 0.8, 0.03);
-        victim.sendSystemMessage(Component.translatable("ability.lotmcraft.curse_of_the_mind.broken_by_death")
-                .withStyle(ChatFormatting.DARK_RED, ChatFormatting.ITALIC));
-    }
-
-    private static boolean isBelowKillThreshold(ServerPlayer player) {
-        return player.getData(ModAttachments.KILL_STATS_COMPONENT).getPlayerKills() < MIN_PLAYER_KILLS;
-    }
-
-    private static List<PlayerInfo> getEligibleSinners(MinecraftServer server, UUID excludeUUID) {
-        List<PlayerInfo> sinners = new ArrayList<>();
-        for (ServerPlayer player : server.getPlayerList().getPlayers()) {
-            if (player.getUUID().equals(excludeUUID)) {
-                continue;
-            }
-            if (player.getData(ModAttachments.KILL_STATS_COMPONENT).getPlayerKills() >= MIN_PLAYER_KILLS) {
-                sinners.add(new PlayerInfo(player.getUUID(), player.getName().getString()));
-            }
+        ParticleUtil.spawnParticles(level, CURSE_DUST, vessel.getEyePosition(), 20, 0.8, 0.03);
+        if (vessel instanceof ServerPlayer vesselPlayer) {
+            vesselPlayer.sendSystemMessage(Component.translatable("ability.lotmcraft.curse_of_the_mind.broken_by_death")
+                    .withStyle(ChatFormatting.DARK_RED, ChatFormatting.ITALIC));
         }
-        return sinners;
     }
 
     /**
@@ -301,7 +338,7 @@ public class CurseOfTheMindAbility extends Ability {
         return "curse_of_the_mind_ability";
     }
 
-    // Deferred final strikes for targets whose curse expired while offline
+    // Deferred final strikes for vessels whose curse expired while offline
     @SubscribeEvent
     public static void onPlayerJoin(PlayerEvent.PlayerLoggedInEvent event) {
         if (!(event.getEntity() instanceof ServerPlayer player)) {
